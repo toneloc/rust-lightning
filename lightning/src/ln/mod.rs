@@ -45,7 +45,6 @@ pub mod onion_utils;
 pub mod outbound_payment;
 pub mod wire;
 
-#[allow(dead_code)] // TODO(dual_funding): Remove once contribution to V2 channels is enabled.
 pub(crate) mod interactivetxs;
 
 // Older rustc (which we support) refuses to let us call the get_payment_preimage_hash!() macro

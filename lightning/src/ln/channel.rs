@@ -1640,6 +1640,14 @@ where
 		}
 	}
 
+	pub fn as_unfunded_v2_mut(&mut self) -> Option<&mut PendingV2Channel<SP>> {
+		if let ChannelPhase::UnfundedV2(channel) = &mut self.phase {
+			Some(channel)
+		} else {
+			None
+		}
+	}
+
 	#[rustfmt::skip]
 	pub fn signer_maybe_unblocked<L: Logger, CBP>(
 		&mut self, chain_hash: ChainHash, logger: &L, path_for_release_htlc: CBP
@@ -6793,16 +6801,13 @@ pub(super) struct FundingNegotiationContext {
 	/// to the current block height to align incentives against fee-sniping.
 	pub funding_tx_locktime: LockTime,
 	/// The feerate set by the initiator to be used for the funding transaction.
-	#[allow(dead_code)] // TODO(dual_funding): Remove once V2 channels is enabled.
 	pub funding_feerate_sat_per_1000_weight: u32,
 	/// The input spending the previous funding output, if this is a splice.
 	#[allow(dead_code)] // TODO(splicing): Remove once splicing is enabled.
 	pub shared_funding_input: Option<SharedOwnedInput>,
 	/// The funding inputs we will be contributing to the channel.
-	#[allow(dead_code)] // TODO(dual_funding): Remove once contribution to V2 channels is enabled.
 	pub our_funding_inputs: Vec<FundingTxInput>,
 	/// The funding outputs we will be contributing to the channel.
-	#[allow(dead_code)] // TODO(dual_funding): Remove once contribution to V2 channels is enabled.
 	pub our_funding_outputs: Vec<TxOut>,
 }
 
@@ -8259,6 +8264,9 @@ where
 			.as_mut()
 			.expect("signing session should be present")
 			.received_commitment_signed();
+		// Signal that tx_signatures should be sent once the monitor update completes,
+		// matching the behavior in splice_initial_commitment_signed.
+		self.context.monitor_pending_tx_signatures = true;
 		Ok(channel_monitor)
 	}
 
@@ -14292,7 +14300,6 @@ impl<SP: SignerProvider> OutboundV1Channel<SP> {
 		self.context.force_shutdown(&self.funding, closure_reason)
 	}
 
-	#[allow(dead_code)] // TODO(dual_funding): Remove once opending V2 channels is enabled.
 	pub fn new<ES: EntropySource, F: FeeEstimator, L: Logger>(
 		fee_estimator: &LowerBoundedFeeEstimator<F>, entropy_source: &ES, signer_provider: &SP,
 		counterparty_node_id: PublicKey, their_features: &InitFeatures,
@@ -14948,7 +14955,6 @@ pub(super) struct PendingV2Channel<SP: SignerProvider> {
 }
 
 impl<SP: SignerProvider> PendingV2Channel<SP> {
-	#[allow(dead_code)] // TODO(dual_funding): Remove once creating V2 channels is enabled.
 	#[rustfmt::skip]
 	pub fn new_outbound<ES: EntropySource, F: FeeEstimator, L: Logger>(
 		fee_estimator: &LowerBoundedFeeEstimator<F>, entropy_source: &ES, signer_provider: &SP,
@@ -15013,6 +15019,87 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 			interactive_tx_constructor: None,
 		};
 		Ok(chan)
+	}
+
+	/// Handles an [`AcceptChannelV2`] message from the counterparty for an outbound v2 channel.
+	///
+	/// Validates the message, updates channel state with counterparty parameters, computes the
+	/// deterministic channel ID, and creates the [`InteractiveTxConstructor`] to begin the
+	/// interactive transaction protocol.
+	///
+	/// Returns the new deterministic channel ID and the first interactive tx message to send.
+	///
+	/// [`AcceptChannelV2`]: crate::ln::msgs::AcceptChannelV2
+	#[rustfmt::skip]
+	pub fn accept_channel_v2<ES: EntropySource>(
+		&mut self,
+		msg: &msgs::AcceptChannelV2,
+		default_limits: &ChannelHandshakeLimits,
+		their_features: &InitFeatures,
+		entropy_source: &ES,
+		holder_node_id: PublicKey,
+	) -> Result<(ChannelId, Option<InteractiveTxMessageSend>), ChannelError> {
+		// Compute the counterparty's channel reserve for v2 channels (1% of total value).
+		let their_funding_satoshis = msg.funding_satoshis;
+		let total_funding_satoshis = self.funding_negotiation_context.our_funding_contribution
+			.to_sat().saturating_add(their_funding_satoshis as i64) as u64;
+
+		let counterparty_selected_channel_reserve_satoshis = get_v2_channel_reserve_satoshis(
+			total_funding_satoshis,
+			MIN_CHAN_DUST_LIMIT_SATOSHIS,
+			msg.disable_channel_reserve.is_some(),
+		);
+
+		// Validate the accept_channel_v2 message and store counterparty parameters.
+		// This stores counterparty pubkeys, shutdown script, and transitions channel state.
+		self.context.do_accept_channel_checks(
+			&mut self.funding,
+			default_limits,
+			their_features,
+			&msg.common_fields,
+			counterparty_selected_channel_reserve_satoshis,
+		)?;
+
+		// Store the counterparty's second per-commitment point (v2-specific).
+		// The first is stored by do_accept_channel_checks in counterparty_next_commitment_point.
+		self.context.counterparty_current_commitment_point = Some(msg.second_per_commitment_point);
+
+		// Compute the deterministic v2 channel ID now that we have both revocation basepoints.
+		let channel_id = ChannelId::v2_from_revocation_basepoints(
+			&self.funding.get_holder_pubkeys().revocation_basepoint,
+			&self.funding.get_counterparty_pubkeys().revocation_basepoint,
+		);
+		self.context.channel_id = channel_id;
+
+		// Build the shared funding output for the interactive tx constructor.
+		let our_funding_satoshis = self.funding_negotiation_context.our_funding_contribution
+			.to_sat().max(0) as u64;
+		let shared_funding_output = TxOut {
+			value: Amount::from_sat(total_funding_satoshis),
+			script_pubkey: self.funding.get_funding_redeemscript().to_p2wsh(),
+		};
+
+		// Create the interactive tx constructor as the initiator (outbound).
+		let (constructor, first_message) = InteractiveTxConstructor::new_for_outbound(
+			InteractiveTxConstructorArgs {
+				entropy_source,
+				holder_node_id,
+				counterparty_node_id: self.context.counterparty_node_id,
+				channel_id,
+				feerate_sat_per_kw: self.funding_negotiation_context.funding_feerate_sat_per_1000_weight,
+				funding_tx_locktime: self.funding_negotiation_context.funding_tx_locktime,
+				inputs_to_contribute: self.funding_negotiation_context.our_funding_inputs.clone(),
+				shared_funding_input: None,
+				shared_funding_output: SharedOwnedOutput::new(
+					shared_funding_output,
+					our_funding_satoshis,
+				),
+				outputs_to_contribute: self.funding_negotiation_context.our_funding_outputs.clone(),
+			}
+		);
+		self.interactive_tx_constructor = Some(constructor);
+
+		Ok((channel_id, first_message))
 	}
 
 	/// If we receive an error message, it may only be a rejection of the channel type we tried,
@@ -15089,18 +15176,20 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 
 	/// Creates a new dual-funded channel from a remote side's request for one.
 	/// Assumes chain_hash has already been checked and corresponds with what we expect!
-	/// TODO(dual_funding): Allow contributions, pass intended amount and inputs
-	#[allow(dead_code)] // TODO(dual_funding): Remove once V2 channels is enabled.
+	/// Creates a new dual-funded channel from a remote side's request for one.
+	/// Assumes chain_hash has already been checked and corresponds with what we expect!
+	///
+	/// `our_funding_contribution_sats` and `our_funding_inputs` specify the acceptor's funding
+	/// contribution. Pass 0 and an empty vec for zero-contribution acceptance.
 	#[rustfmt::skip]
 	pub fn new_inbound<ES: EntropySource, F: FeeEstimator, L: Logger>(
 		fee_estimator: &LowerBoundedFeeEstimator<F>, entropy_source: &ES, signer_provider: &SP,
 		holder_node_id: PublicKey, counterparty_node_id: PublicKey, our_supported_features: &ChannelTypeFeatures,
 		their_features: &InitFeatures, msg: &msgs::OpenChannelV2,
 		user_id: u128, config: &UserConfig, current_chain_height: u32, logger: &L, trusted_channel_features: Option<TrustedChannelFeatures>,
+		our_funding_contribution_sats: u64, our_funding_inputs: Vec<FundingTxInput>,
 	) -> Result<Self, ChannelError> {
-		// TODO(dual_funding): Take these as input once supported
-		let (our_funding_contribution, our_funding_contribution_sats) = (SignedAmount::ZERO, 0u64);
-		let our_funding_inputs = Vec::new();
+		let our_funding_contribution = SignedAmount::from_sat(our_funding_contribution_sats as i64);
 
 		let channel_value_satoshis =
 			our_funding_contribution_sats.saturating_add(msg.common_fields.funding_satoshis);
@@ -15189,7 +15278,6 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 	/// should be sent back to the counterparty node.
 	///
 	/// [`msgs::AcceptChannelV2`]: crate::ln::msgs::AcceptChannelV2
-	#[allow(dead_code)] // TODO(dual_funding): Remove once V2 channels is enabled.
 	#[rustfmt::skip]
 	pub fn accept_inbound_dual_funded_channel(&self) -> msgs::AcceptChannelV2 {
 		if self.funding.is_outbound() {
@@ -15213,7 +15301,6 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 	/// use [`InboundV1Channel::accept_inbound_channel`] instead.
 	///
 	/// [`msgs::AcceptChannelV2`]: crate::ln::msgs::AcceptChannelV2
-	#[allow(dead_code)] // TODO(dual_funding): Remove once V2 channels is enabled.
 	fn generate_accept_channel_v2_message(&self) -> msgs::AcceptChannelV2 {
 		let first_per_commitment_point = self.context.holder_signer.get_per_commitment_point(
 			self.unfunded_context.transaction_number(), &self.context.secp_ctx)
@@ -15258,7 +15345,6 @@ impl<SP: SignerProvider> PendingV2Channel<SP> {
 	///
 	/// [`msgs::AcceptChannelV2`]: crate::ln::msgs::AcceptChannelV2
 	#[cfg(test)]
-	#[allow(dead_code)] // TODO(dual_funding): Remove once contribution to V2 channels is enabled.
 	pub fn get_accept_channel_v2_message(&self) -> msgs::AcceptChannelV2 {
 		self.generate_accept_channel_v2_message()
 	}
